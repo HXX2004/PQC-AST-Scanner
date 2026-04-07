@@ -1,8 +1,8 @@
-import streamlit as st
+import streamlit as st      # 需要安裝: pip install streamlit
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import google.generativeai as genai
+import google.generativeai as genai     # 需要安裝: pip install google-generativeai
 import json
 import os
 from datetime import datetime
