@@ -332,24 +332,3 @@ PQC-AST-Scanner
 ```
 
 ---
-
-# 🔮 未來功能
-
-* 支援更多語言 (Go / Rust / JS)
-* SBOM / CBOM 標準輸出
-* CI/CD integration
-* GitHub Action
-* 自動 PQC 遷移建議
-* 更完整的 PQC library detection
-
----
-
-# 👨‍💻 Author
-
-Post-Quantum Security Research Project
-
----
-
-# 📜 License
-
-MIT License
