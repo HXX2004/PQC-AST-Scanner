@@ -1,43 +1,40 @@
-import streamlit as st      # 需要安裝: pip install streamlit
+import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import google.generativeai as genai     # 需要安裝: pip install google-generativeai
+import google.generativeai as genai
 import json
 import os
 from datetime import datetime
 import tempfile
 # 匯入你的掃描引擎 (確保 scanner.py 放在同一個資料夾)
-from scanner import scan_file, _determine_pqc_status
+from pqc_ast_scannerV2 import scan_file, _determine_pqc_status
 
-# 配置 Gemini
-genai.configure(api_key="Gemini key")
-try:
-    # 獲取所有支援生成內容的模型清單
-    available_models = [m.name for m in genai.list_models() if 'generateContent' in m.supported_generation_methods]
-    
-    # 優先找包含 'flash' 的模型，如果沒有就選第一個
-    target_model = next((m for m in available_models if "flash" in m), available_models[0])
-    
-    model = genai.GenerativeModel(target_model)
-    print(f"成功連線至可用模型: {target_model}")
-except Exception as e:
-    st.error(f"無法獲取模型清單，請檢查 API Key 是否正確：{e}")
-    
-def get_pqc_context():
-    if 'findings' in st.session_state and not st.session_state['findings'].empty:
-        # 只取前 10 筆資料，減少傳輸量
-        df_mini = st.session_state['findings'].head(10)
-        context = "當前掃描到的前 10 項加密資產：\n"
-        for _, row in df_mini.iterrows():
-            # 只抓關鍵欄位
-            context += f"- [{row['Type']}] 位於 {row['Location']}\n"
-        return context
-    return "尚無掃描結果。"
+# 1. 安全地獲取 API Key (優先從 Secrets 抓，沒有則找環境變數)
+GEMINI_KEY = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
 
-# 初始化對話紀錄
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+if GEMINI_KEY:
+    genai.configure(api_key=GEMINI_KEY)
+    model = genai.GenerativeModel('gemini-1.5-flash') # 使用 flash 版本速度快且免費額度高
+else:
+    st.error("系統未配置 API Key，請聯繫管理員。")
+
+def get_ai_response(user_input, scan_context):
+    # 設定 AI 的角色扮演與上下文
+    prompt = f"""
+    你是一位後量子密碼學 (PQC) 專家與 IBM CBOM 審計員。
+    
+    【掃描背景資訊】:
+    {scan_context}
+    
+    【使用者提問】:
+    {user_input}
+    
+    請根據掃描結果給予專業建議。如果發現傳統加密 (如 RSA, ECC)，
+    請建議遷移至 NIST 標準的 PQC 算法 (如 ML-KEM 或 ML-DSA)。
+    """
+    response = model.generate_content(prompt)
+    return response.text
 
 # 1. 頁面配置
 st.set_page_config(page_title="PQC Scanner", layout="wide", initial_sidebar_state="expanded")
