@@ -1,623 +1,277 @@
-import ast
-import sys
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.graph_objects as go
+import google.generativeai as genai
+import json
 import os
-import javalang          # 需要安裝: pip install javalang
-import pycparser         # 需要安裝: pip install pycparser
-from pycparser import c_parser, c_ast, parse_file
-import pandas as pd             # 數據處理
-import plotly.graph_objects as go # 視覺化圖表
-import json                     # JSON 輸出
-from datetime import datetime # 獲取時間戳
-import webbrowser
+from datetime import datetime
+import tempfile
+# 匯入你的掃描引擎 (確保 scanner.py 放在同一個資料夾)
+from scanner import scan_file, _determine_pqc_status
 
-# --- PQC 知識庫與修復建議 (PQC_KNOWLEDGE_BASE) ---
-PQC_KNOWLEDGE_BASE = {
-    # 弱雜湊 (Priority Fixes)
-    "B303": {"type": "WEAK_HASH_SHA1", "message": "使用了 SHA1 雜湊算法。", "fix": "替換為 hashlib.sha256/sha3，SHA1 對碰撞攻擊是脆弱的。"},
-    "B324": {"type": "WEAK_HASH_MD5", "message": "使用了 MD5 雜湊算法。", "fix": "必須移除 MD5，替換為 SHA256。"},
-    # 弱加密算法 (Priority Fixes)
-    "B304": {"type": "WEAK_CIPHER_DES", "message": "使用了 DES/3DES 弱加密算法。", "fix": "停用 DES/3DES，改用 AES-256 GCM 模式。"},
-    # 量子脆弱資產與使用樣式 (PQC/AES)
-    "B413_RSA": {"type": "PQC_TARGET_RSA", "message": "發現 RSA 密鑰生成。", "fix": "量子脆弱：考慮替換為 CRYSTALS-Kyber (KEM) 或 Dilithium (Signature)。"},
-    "B413_AES_WEAK": {"type": "WEAK_CIPHER_MODE", "message": "使用了不安全的 AES/ECB 模式。", "fix": "替換為 AES-256 GCM 或 CCM 模式，確保認證性。"},
-    "B413_AES_SAFE": {"type": "TRADITIONAL_AES_ASSET", "message": "使用了 AES 加密資產。", "fix": "這是一個抗量子資產。請確保 IV/Nonce 是正確生成的。"},
-    "B413_RSA_WEAK_SIZE": {
-        "type": "WEAK_ASSET_RSA", 
-        "message": "發現 RSA 密鑰長度小於 2048 bits，對暴力破解脆弱。", 
-        "fix": "將密鑰長度至少增加到 2048/4096 bits，並規劃 PQC 遷移。"
-    },
-    # CBC/CFB 模式 IV 缺失 (使用樣式風險)
-    "B413_IV_WEAK": {
-        "type": "WEAK_IV_NONCE", 
-        "message": "在 CBC/CFB 模式中，未偵測到 IV/Nonce 參數，易受重放攻擊。", 
-        "fix": "必須使用 os.urandom (Python) 或 SecureRandom (Java) 創建隨機 IV。"
-    },
-    # 量子脆弱的 ECC
-    "B413_ECC": { 
-        "type": "PQC_TARGET_ECC", 
-        "message": "發現 ECC/ECDSA/ECDH 橢圓曲線加密資產。", 
-        "fix": "核心量子脆弱資產，建議替換為 CRYSTALS-Dilithium/Falcon。"
-    },
-	# 硬編碼偵測
-	"B105_HARDCODED_SECRET": {
-    "type": "SECRET_LEAKAGE",
-    "message": "發現硬編碼密鑰，可能導致密鑰洩露，影響 PQC 遷移後的安全性。",
-    "fix": "將密鑰儲存於環境變數或專門的密鑰管理器中。"
-	},
-    # --- PQC 正面識別 (PQC Ready) ---
-    "B501_KYBER": {"type": "PQC_KEM_ML_KEM", "message": "發現 NIST 標準 PQC 算法：ML-KEM (Kyber)。", "fix": "PQC READY。請確保實作符合 FIPS 203 標準。"},
-    "B502_DILITHIUM": {"type": "PQC_SIGN_ML_DSA", "message": "發現 NIST 標準 PQC 算法：ML-DSA (Dilithium)。", "fix": "PQC READY。請確保實作符合 FIPS 204 標準。"},
-    # --- [HARDCORE] 硬編碼與機密管理 ---
-    "B702_HARDCODED_KEY": {"type": "HARDCODED_SECRET_KEY", "message": "偵測到疑似硬編碼的加密金鑰。", "fix": "絕對禁止在程式碼中寫死金鑰。請改用環境變數或 KMS。"},
-    "B706_HARDCODED_PASSWORD": {"type": "HARDCODED_PASSWORD", "message": "偵測到疑似硬編碼的密碼。", "fix": "請勿將密碼儲存在原始碼中。"},
-    "B707_HARDCODED_AWS": {"type": "HARDCODED_CLOUD_CREDENTIAL", "message": "偵測到硬編碼 AWS Key (AKIA...)。", "fix": "使用 IAM Role。"},
-    "B708_HARDCODED_TOKEN": {"type": "HARDCODED_API_TOKEN", "message": "偵測到疑似硬編碼 API Token。", "fix": "動態生成 Token。"},
-    "B709_HARDCODED_PQC_SK": {"type": "HARDCODED_PQC_PRIVATE_KEY", "message": "偵測到疑似 PQC 私鑰硬編碼。", "fix": "PQC 私鑰極為敏感。"},
-    "B701_WEAK_RNG": {"type": "WEAK_RANDOM_SOURCE", "message": "使用弱亂數 (random)。", "fix": "改用 os.urandom。"},
+# 1. 安全地獲取 API Key (優先從 Secrets 抓，沒有則找環境變數)
+GEMINI_KEY = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
 
-    # --- [ADVANCE] 進階參數檢查 ---
-    "B415_ECC_WEAK_CURVE": {"type": "WEAK_ECC_CURVE", "message": "弱橢圓曲線 (如 P-192)。", "fix": "使用 NIST P-256 以上。"},
-    "B703_WEAK_KDF_ITERATIONS": {"type": "WEAK_KDF_ITERATION_COUNT", "message": "PBKDF2 迭代次數過低。", "fix": "建議 > 600,000 次。"},
-    "B710_SHORT_SALT": {"type": "INSUFFICIENT_SALT_LENGTH", "message": "Salt 長度不足。", "fix": "Salt 應 > 16 bytes。"},
-    "B416_GCM_NONCE_LENGTH": {"type": "RISKY_GCM_NONCE_LENGTH", "message": "GCM Nonce 非 12 bytes。", "fix": "固定為 12 bytes。"},
-}
-# ----------------------------------------
+if GEMINI_KEY:
+    genai.configure(api_key=GEMINI_KEY)
+    model = genai.GenerativeModel('gemini-1.5-flash') # 使用 flash 版本速度快且免費額度高
+else:
+    st.error("系統未配置 API Key，請聯繫管理員。")
 
-
-# --- 核心邏輯：報告生成 (作為獨立函數) ---
-def report_finding(node, filename, line, rule_id, custom_message=None):
-    info = PQC_KNOWLEDGE_BASE.get(rule_id, {"type": "UNKNOWN", "message": "未知規則", "fix": "N/A"})
+def get_ai_response(user_input, scan_context):
+    # 設定 AI 的角色扮演與上下文
+    prompt = f"""
+    你是一位後量子密碼學 (PQC) 專家與 IBM CBOM 審計員。
     
-    # 根據節點類型獲取代碼片段（適應 Python, Java, C）
-    if isinstance(node, str):
-        code_snippet = node
-    elif isinstance(node, (ast.Call, ast.Attribute)):
-        code_snippet = ast.unparse(node).strip()
-    elif hasattr(node, 'value'):
-        # 適用於 javalang 的 Literal 節點
-        code_snippet = str(node.value).strip('"') 
-    elif hasattr(node, 'name'):
-        # 適用於 C AST (FuncCall)
-        code_snippet = str(node.name) if isinstance(node, c_ast.FuncCall) else str(node)
-    else:
-        code_snippet = str(node)
-
-    location_str = f"{filename}:{line}" if line > 0 else f"{filename}:N/A"
-
-    return {
-        "RuleID": rule_id,
-        "Type": info.get('type', 'UNKNOWN_TYPE'),
-        "Location": location_str,
-        "CodeSnippet": code_snippet,
-        "Message": custom_message if custom_message else info.get('message', 'N/A'),
-        "FixSuggestion": info.get('fix', 'N/A')
-    }
-
-def _determine_pqc_status(rule_id):
-    """決定資產的 PQC 狀態 (用於 CBOM)"""
-    if "HARDCODED" in rule_id: return "CRITICAL_SECRET_LEAK"
-    if any(k in rule_id for k in ["SHA1", "MD5", "DES"]): return "VULNERABLE (CLASSIC)"
-    if any(k in rule_id for k in ["RSA", "ECC", "WEAK"]): return "VULNERABLE (QUANTUM)"
-    if any(k in rule_id for k in ["KYBER", "DILITHIUM"]): return "PQC_READY"
-    if "AES" in rule_id and "SAFE" in rule_id: return "SAFE (QUANTUM-RESISTANT)"
-    return "UNKNOWN"
-
-# --- Python 掃描核心 ---
-class PQC_AST_Visitor(ast.NodeVisitor):
-    def __init__(self, filename, findings_list):
-        self.filename = filename
-        self.findings_list = findings_list 
-
-    def _get_literal_value(self, node):
-        if isinstance(node, ast.Constant): return node.value
-        return None
-
-    def _get_call_arg_value(self, node, arg_index, kw_name):
-        val = None
-        for k in node.keywords:
-            if k.arg == kw_name and isinstance(k.value, ast.Constant): val = k.value.value
-        if val is None and len(node.args) > arg_index:
-            if isinstance(node.args[arg_index], ast.Constant): val = node.args[arg_index].value
-        return val
-
-    def visit_Assign(self, node):
-        target_name = ""
-        for target in node.targets:
-            if isinstance(target, ast.Name):
-                target_name = target.id.lower()
-                break
-        if not target_name:
-            self.generic_visit(node)
-            return
-
-        # 獲取字面量值 (修正 UnboundLocalError)
-        raw_value = self._get_literal_value(node.value)
-        assigned_value = None 
-        if isinstance(raw_value, str): assigned_value = raw_value
-        elif isinstance(raw_value, bytes):
-            try: assigned_value = raw_value.decode('utf-8')
-            except: assigned_value = str(raw_value)
-
-        # 檢查邏輯
-        if assigned_value and len(assigned_value) > 8: 
-            if assigned_value.startswith(("AKIA", "ASIA")):
-                self.findings_list.append(report_finding(node, self.filename, node.lineno, "B707_HARDCODED_AWS"))
-            elif any(s in target_name for s in ['password', 'passwd', 'pwd']) and "hash" not in target_name:
-                self.findings_list.append(report_finding(node, self.filename, node.lineno, "B706_HARDCODED_PASSWORD"))
-            elif ("token" in target_name or "api_key" in target_name) and "csrf" not in target_name and len(assigned_value) > 10:
-                self.findings_list.append(report_finding(node, self.filename, node.lineno, "B708_HARDCODED_TOKEN"))
-            elif ("sk" in target_name or "secret_key" in target_name) and ("pqc" in target_name or "kyber" in target_name):
-                 self.findings_list.append(report_finding(node, self.filename, node.lineno, "B709_HARDCODED_PQC_SK"))
-            elif any(s in target_name for s in ['key', 'secret', 'private']):
-                if "public" not in target_name and "pub" not in target_name:
-                    self.findings_list.append(report_finding(node, self.filename, node.lineno, "B702_HARDCODED_KEY"))
-        self.generic_visit(node)# 確保繼續遍歷子節點
-
-    def visit_Call(self, node):
-        full_name = self._get_full_name(node.func)
-        
-        # 1. 弱雜湊 (最高優先級別)
-        if "hashlib.sha1" in full_name:
-            self.findings_list.append(report_finding(node, self.filename, node.lineno, "B303"))
-        elif "hashlib.md5" in full_name: 
-            self.findings_list.append(report_finding(node, self.filename, node.lineno, "B324"))
-        elif "random.random" in full_name or "random.randint" in full_name:
-            self.findings_list.append(report_finding(node, self.filename, node.lineno, "B701_WEAK_RNG"))   
-
-        # 2. 量子脆弱/弱加密 (DES, RSA)
-        elif any(x in full_name for x in ["DES.new", "DES3.new", "Crypto.Cipher.DES"]):
-            self.findings_list.append(report_finding(node, self.filename, node.lineno, "B304"))
-            
-        elif "RSA.generate" in full_name:
-            key_size = self._get_int_arg(node.args, 0)
-            if key_size is not None and key_size < 2048:
-                 self.findings_list.append(report_finding(node, self.filename, node.lineno, "B413_RSA_WEAK_SIZE"))
-            else:
-                 self.findings_list.append(report_finding(node, self.filename, node.lineno, "B413_RSA"))
-                 
-        # 3. AES 模式檢查 (修正邏輯，確保 ECB/IV 缺失優先被檢查)
-        elif "AES.new" in full_name:
-            is_ecb = self._is_ecb_mode(node)
-            is_cbc_cfb = self._is_cbc_cfb_mode(node)
-            iv_is_missing = not self._has_keyword_arg(node.keywords, 'iv')
-            
-            # 確保最危險的模式優先被標記 (ECB)
-            if is_ecb: 
-                finding = report_finding(node, self.filename, node.lineno, "B413_AES_WEAK") 
-            # 其次檢查 IV 缺失 (使用樣式漏洞)
-            elif is_cbc_cfb and iv_is_missing: 
-                 finding = report_finding(node, self.filename, node.lineno, "B413_IV_WEAK") 
-            # 最後，如果通過所有漏洞檢查，則視為安全資產
-            else:
-                 finding = report_finding(node, self.filename, node.lineno, "B413_AES_SAFE") 
-            
-            self.findings_list.append(finding)
-
-        if node.args or node.keywords:
-            args_str = ""
-            try:
-                # 將所有參數轉為字串以進行關鍵字搜索
-                args_str = ", ".join([ast.unparse(a) for a in node.args])
-                args_str += ", ".join([ast.unparse(k.value) for k in node.keywords])
-            except: pass
-            
-            args_str = args_str.upper()
-            if "KYBER" in args_str or "ML-KEM" in args_str:
-                self.findings_list.append(report_finding(node, self.filename, node.lineno, "B501_KYBER"))
-            elif "DILITHIUM" in args_str or "ML-DSA" in args_str:
-                self.findings_list.append(report_finding(node, self.filename, node.lineno, "B502_DILITHIUM")) 
-
-        if "PBKDF2" in full_name:
-            iters = self._get_call_arg_value(node, 3, 'iterations')
-            if iters is not None and isinstance(iters, int) and iters < 600000:
-                self.findings_list.append(report_finding(node, self.filename, node.lineno, "B703_WEAK_KDF_ITERATIONS"))
-        
-        if "generate_private_key" in full_name and "ec" in full_name:
-            for k in node.keywords:
-                if k.arg == 'curve':
-                    val = ast.unparse(k.value).upper() if hasattr(ast, 'unparse') else ""
-                    if any(w in val for w in ['SECP192', 'SECT163', 'BRAINPOOLP160']):
-                        self.findings_list.append(report_finding(node, self.filename, node.lineno, "B415_ECC_WEAK_CURVE"))
-
-        elif "ECC.generate" in full_name:
-            is_weak_curve = False
-            for k in node.keywords:
-                # 檢查 curve='P-192' 等弱曲線
-                if k.arg == 'curve':
-                    val = ast.unparse(k.value).upper() if hasattr(ast, 'unparse') else ""
-                    if any(w in val for w in ['P-192', 'SECP192', 'BRAINPOOLP160']):
-                        self.findings_list.append(report_finding(node, self.filename, node.lineno, "B415_ECC_WEAK_CURVE"))
-                        is_weak_curve = True
-            
-            # 如果不是弱曲線，它仍然是 PQC 遷移目標 (ECC 本身對量子脆弱)
-            if not is_weak_curve:
-                self.findings_list.append(report_finding(node, self.filename, node.lineno, "B413_ECC"))
-
-        # --- [B710] Salt 長度檢查 (針對 os.urandom) ---
-        # 檢查: os.urandom(N) 其中 N < 16
-        if "os.urandom" in full_name:
-            size = self._get_int_arg(node.args, 0)
-            # 排除 12 (GCM Nonce 標準長度)，只針對過短的 Salt/IV
-            if size is not None and size < 16 and size != 12:
-                self.findings_list.append(report_finding(node, self.filename, node.lineno, "B710_SHORT_SALT"))
-
-        # --- [B416] AES-GCM Nonce 長度檢查 ---
-        # 檢查: AES.new(..., nonce=os.urandom(N)) 其中 N != 12
-        if "AES.new" in full_name:
-            # 檢查是否使用了 GCM 模式
-            is_gcm = False
-            for k in node.keywords:
-                if k.arg == 'mode' and 'GCM' in ast.unparse(k.value).upper():
-                    is_gcm = True
-                    break
-            
-            # 如果是 GCM，檢查 nonce 參數
-            if is_gcm:
-                for k in node.keywords:
-                    if k.arg == 'nonce':
-                        # 檢查 nonce 是否來自 os.urandom
-                        if isinstance(k.value, ast.Call) and "urandom" in ast.unparse(k.value.func):
-                             nonce_size = self._get_int_arg(k.value.args, 0)
-                             if nonce_size is not None and nonce_size != 12:
-                                  self.findings_list.append(report_finding(node, self.filename, node.lineno, "B416_GCM_NONCE_LENGTH"))
-
-        # 確保繼續遍歷子節點
-        self.generic_visit(node)
-
-    # 辅助函数: 获取完整函数名
-    def _get_full_name(self, node):
-        if isinstance(node, ast.Attribute):
-            return self._get_full_name(node.value) + "." + node.attr
-        elif isinstance(node, ast.Name):
-            return node.id
-        return ""
+    【掃描背景資訊】:
+    {scan_context}
     
-    # 辅助函数: 检查 ECB 模式
-    def _is_ecb_mode(self, call_node):
-        for keyword in call_node.keywords:
-            if keyword.arg == 'mode':
-                return 'ECB' in ast.unparse(keyword.value).upper()
-        # 檢查第二個位置參數
-        if len(call_node.args) > 1:
-            return 'ECB' in ast.unparse(call_node.args[1]).upper()
-        return False
+    【使用者提問】:
+    {user_input}
     
-    # 辅助函数: 检查 CBC/CFB 模式 (需要 IV)
-    def _is_cbc_cfb_mode(self, call_node):
-        for keyword in call_node.keywords:
-            if keyword.arg == 'mode':
-                mode = ast.unparse(keyword.value).upper()
-                return 'CBC' in mode or 'CFB' in mode
-        # 檢查第二個位置參數
-        if len(call_node.args) > 1:
-            mode = ast.unparse(call_node.args[1]).upper()
-            return 'CBC' in mode or 'CFB' in mode
-        return False
+    請根據掃描結果給予專業建議。如果發現傳統加密 (如 RSA, ECC)，
+    請建議遷移至 NIST 標準的 PQC 算法 (如 ML-KEM 或 ML-DSA)。
+    """
+    response = model.generate_content(prompt)
+    return response.text
+
+# 1. 頁面配置
+st.set_page_config(page_title="PQC Scanner", layout="wide", initial_sidebar_state="expanded")
+
+# --- 2. 最左側：來源區 (Sidebar) ---
+with st.sidebar:
+    st.markdown("### 來源")
     
-    # 辅助函数: 检查关键字参数是否存在
-    def _has_keyword_arg(self, keywords, arg_name):
-        return any(keyword.arg == arg_name for keyword in keywords)
+    # 檔案上傳器
+    uploaded_files = st.file_uploader(
+        "上傳程式碼進行 PQC 掃描", 
+        accept_multiple_files=True
+    )
+    st.divider()
+    
+    if uploaded_files:
+        st.success(f"已載入 {len(uploaded_files)} 個檔案")
         
-    # 辅助函数: 获取整数参数 (Key Size)
-    def _get_int_arg(self, args, index):
-        if len(args) > index:
-            arg = args[index]
-            if isinstance(arg, ast.Constant) and isinstance(arg.value, int):
-                return arg.value
-        return None
-
-    def visit_Constant(self, node):
-        """
-        捕捉所有字串常數，用於識別 PQC 關鍵字 (Kyber, Dilithium)
-        適用於 Python 3.8+ (舊版 Python 使用 visit_Str)
-        """
-        if isinstance(node.value, str):
-            val = node.value.upper()
-            # 檢查 PQC 關鍵字
-            if "KYBER" in val or "ML-KEM" in val:
-                self.findings_list.append(report_finding(node, self.filename, node.lineno, "B501_KYBER"))
-            elif "DILITHIUM" in val or "ML-DSA" in val:
-                self.findings_list.append(report_finding(node, self.filename, node.lineno, "B502_DILITHIUM"))
-        
-        # 繼續遍歷 (雖然 Constant 通常是葉節點)
-        self.generic_visit(node)
-        
-def scan_python(filepath):
-    findings_list = []
-    with open(filepath, 'r', encoding='utf-8') as f:
-        code = f.read()
-    tree = ast.parse(code, filename=filepath) 
-    visitor = PQC_AST_Visitor(filepath, findings_list)
-    visitor.visit(tree)
-    return findings_list
-
-
-# --- Java 掃描核心 ---
-
-def is_secret_var(name):
-    """ 判斷變數名稱是否敏感 """
-    sensitive = ['key', 'secret', 'password', 'passwd', 'pwd', 'token', 'private', 'credential']
-    name = name.lower()
-    return any(k in name for k in sensitive) and "public" not in name and "hash" not in name
-
-def scan_java(filepath):
-    findings_list = []
-    with open(filepath, 'r', encoding='utf-8') as f:
-        code = f.read()
-
-    try:
-        # javalang 解析器
-        tree = javalang.parse.parse(code) 
-        
-    except javalang.tokenizer.LexerError as e:
-        # 捕獲詞法錯誤 (例如非法字符)，返回錯誤資訊
-        print(f"❌ Java Lexer Error (可能為非法字符或 BOM): {e}")
-        return []
-    except javalang.parser.ParserError as e:
-        # 捕獲語法錯誤 (例如缺少分號或類別名錯誤)
-        print(f"❌ Java Parser Error (語法錯誤或結構不完整): {e}")
-        return []
-    except Exception as e:
-        # 捕獲其他所有錯誤
-        print(f"❌ Java AST 錯誤: {e}")
-        return []
-
-    # --- 成功解析後，開始遍歷 AST ---
-    for path, node in tree:
-        try:
-            # 確保 node 是一個 javalang AST 節點， path 是節點路徑
-            if not isinstance(node, javalang.tree.Node):
-                continue
-        except ValueError:
-            # 捕獲 too many values to unpack 錯誤
-            # 這表示 javalang 返回的不是 (path, node) 格式
-            continue
-        
-        line_num = node.position.line if node.position else 0
-
-        # 如果行號為 0 (缺失)，嘗試從路徑中回溯到最近的父節點
-        if line_num == 0:
-            # 關鍵修正：將 path 迭代包裹在 try-except 塊中，以防 path 內部結構不穩定
-            try:
-                for p_item in reversed(path):
-                    # p_item 應該是 (attribute_name, p_node)
-                    if len(p_item) == 2:
-                        p_node = p_item[1]
-                        if p_node.position:
-                            line_num = p_node.position.line
-                            break
-            except Exception:
-                # 捕獲 path 迭代時的解包錯誤
-                pass
-        
-        # 排除掉頂層的 PackageDeclaration 或 Import 語句
-        if line_num == 0 and isinstance(node, (javalang.tree.PackageDeclaration, javalang.tree.Import)):
-            continue
-        
-        
-        # 1. 方法呼叫檢查 (MethodInvocation)
-        if isinstance(node, javalang.tree.MethodInvocation):
+        if st.button("開始掃描", use_container_width=True):
+            all_findings = []
             
-            # [getInstance 檢查]
-            if node.member == 'getInstance':
-                if node.arguments and isinstance(node.arguments[0], javalang.tree.Literal):
-                    arg_value = node.arguments[0].value.strip('"').upper()
-                    
-                    # === 構造清晰的代碼片段 (getInstance) ===
-                    qualifier = node.qualifier if node.qualifier else "Cipher/Digest"
-                    readable_snippet = f"{qualifier}.getInstance(\"{node.arguments[0].value.strip('\"')}\")"
-                    
-                    # 規則匹配 (使用 readable_snippet)
-                    if "SHA1" in arg_value or "SHA-1" in arg_value:
-                        findings_list.append(report_finding(readable_snippet, filepath, line_num, "B303"))
-                    elif "MD5" in arg_value:
-                        findings_list.append(report_finding(readable_snippet, filepath, line_num, "B324"))
-                    elif "DES" in arg_value or "DESEDE" in arg_value:
-                        findings_list.append(report_finding(readable_snippet, filepath, line_num, "B304")) 
-                    elif "AES" in arg_value:
-                        if "ECB" in arg_value:
-                            findings_list.append(report_finding(readable_snippet, filepath, line_num, "B413_AES_WEAK")) 
-                        else:
-                            findings_list.append(report_finding(readable_snippet, filepath, line_num, "B413_AES_SAFE"))
-                    elif "RSA" in arg_value:
-                        findings_list.append(report_finding(readable_snippet, filepath, line_num, "B413_RSA"))
-                    elif "EC" in arg_value or "ECDSA" in arg_value or "ECDH" in arg_value:
-                        findings_list.append(report_finding(readable_snippet, filepath, line_num, "B413_ECC"))
+            # 遍歷所有上傳的檔案
+            for i, file in enumerate(uploaded_files):
+                # 建立暫存檔以供 scanner.py 讀取
+                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.name)[1]) as tmp:
+                    tmp.write(file.getvalue())
+                    tmp_path = tmp.name
 
-            # [initialize 檢查]
-            elif node.member == 'initialize':
-                if len(node.arguments) == 1 and isinstance(node.arguments[0], javalang.tree.Literal):
-                    try:
-                        key_size = int(node.arguments[0].value)
-                        readable_snippet = f"keyPairGenerator.initialize({key_size})" 
-                        
-                        if key_size < 2048:
-                            findings_list.append(report_finding(readable_snippet, filepath, line_num, "B413_RSA_WEAK_SIZE", f"RSA 金鑰過短 ({key_size})"))
-                        else:
-                            findings_list.append(report_finding(readable_snippet, filepath, line_num, "B413_RSA", "RSA 金鑰生成 (PQC 目標)"))
-                    except ValueError:
-                        pass
-            
-            # [弱亂數 nextInt/nextBytes 檢查]
-            elif node.member == 'nextInt' or node.member == 'nextBytes':
-                if hasattr(node, 'qualifier') and node.qualifier and 'rand' in node.qualifier.lower() and 'secure' not in node.qualifier.lower():
-                    readable_snippet = f"{node.qualifier}.{node.member}(...)"
-                    findings_list.append(report_finding(readable_snippet, filepath, line_num, "B701_WEAK_RNG"))
-        # 2. 變數宣告檢查 (LocalVariableDeclaration) - 硬編碼機密
-        elif isinstance(node, javalang.tree.LocalVariableDeclaration):
-            for declarator in node.declarators:
-                var_name = declarator.name.lower()
-
-                # [硬編碼機密檢查]
-                if declarator.initializer and isinstance(declarator.initializer, javalang.tree.Literal):
-                    raw_value = str(declarator.initializer.value)
-                    
-                    if raw_value.startswith('"'):
-                        value = raw_value.strip('"')
-                        # === 構造硬編碼密鑰片段 ===
-                        readable_snippet = f"{declarator.name} = \"{value[:15]}...\""
-                        
-                        if value.startswith("AKIA") or value.startswith("ASIA"):
-                            findings_list.append(report_finding(readable_snippet, filepath, line_num, "B707_HARDCODED_AWS"))
-                        elif is_secret_var(var_name):
-                            if "password" in var_name:
-                                findings_list.append(report_finding(readable_snippet, filepath, line_num, "B706_HARDCODED_PASSWORD"))
-                            elif "token" in var_name:
-                                findings_list.append(report_finding(readable_snippet, filepath, line_num, "B708_HARDCODED_TOKEN"))
-                            elif "pqc" in var_name or "kyber" in var_name:
-                                findings_list.append(report_finding(readable_snippet, filepath, line_num, "B709_HARDCODED_PQC_SK"))
-                            else:
-                                findings_list.append(report_finding(readable_snippet, filepath, line_num, "B702_HARDCODED_KEY"))
-                
-                # [Salt 長度檢查]
-                if 'salt' in var_name and declarator.initializer:
-                    init = declarator.initializer
-                    readable_snippet = f"byte[] {declarator.name} = new byte[...]"
-                    salt_size = None
-                        
-                    if isinstance(init, javalang.tree.ArrayCreator) and init.dimensions and init.dimensions[0].value.isdigit():
-                        salt_size = int(init.dimensions[0].value)
-                    elif isinstance(init, javalang.tree.ArrayInitializer):
-                        if init.initializers: salt_size = len(init.initializers)
-                        
-                    if salt_size is not None and salt_size < 16:
-                        findings_list.append(report_finding(readable_snippet, filepath, line_num, "B710_SHORT_SALT"))
-
-        # 3. 類別創建檢查 (ClassCreator)
-        elif isinstance(node, javalang.tree.ClassCreator):
-            type_name = node.type.name
-            
-            # [弱亂數]
-            if type_name == 'Random':
-                 readable_snippet = "new Random()"
-                 findings_list.append(report_finding(readable_snippet, filepath, line_num, "B701_WEAK_RNG"))
-
-            # [PBKDF2 迭代次數]
-            elif "PBEKeySpec" in type_name and len(node.arguments) >= 3:
-                iter_arg = node.arguments[2]
-                if isinstance(iter_arg, javalang.tree.Literal) and iter_arg.value.isdigit():
-                    iterations = int(iter_arg.value)
-                    if iterations < 600000:
-                        readable_snippet = f"new {type_name}(..., {iterations}, ...)"
-                        findings_list.append(report_finding(readable_snippet, filepath, line_num, "B703_WEAK_KDF_ITERATIONS"))
-
-            # [ECC 曲線檢查]
-            elif "ECGenParameterSpec" in type_name and len(node.arguments) > 0:
-                curve_arg = node.arguments[0]
-                if isinstance(curve_arg, javalang.tree.Literal):
-                    curve_name = curve_arg.value.strip('"').upper()
-                    readable_snippet = f"new {type_name}(\"{curve_name}\")"
-                    
-                    if any(w in curve_name for w in ['SECP192', 'SECT163', 'BRAINPOOLP160']):
-                        findings_list.append(report_finding(readable_snippet, filepath, line_num, "B415_ECC_WEAK_CURVE"))
-
-            # [GCM Nonce 長度檢查]
-            elif "GCMParameterSpec" in type_name and len(node.arguments) >= 2:
-                iv_arg = node.arguments[1]
-                readable_snippet = f"new GCMParameterSpec(...)"
-                if isinstance(iv_arg, javalang.tree.ArrayCreator):
-                    for dim in iv_arg.dimensions:
-                        if isinstance(dim, javalang.tree.Literal) and dim.value.isdigit():
-                            size = int(dim.value)
-                            if size != 12:
-                                findings_list.append(report_finding(readable_snippet, filepath, line_num, "B416_GCM_NONCE_LENGTH"))
-        
-        # 4. 字串常數檢查 (PQC 識別)
-        elif isinstance(node, javalang.tree.Literal):
-            val = str(node.value)
-            if val.startswith('"'):
-                val_clean = val.strip('"').upper()
-                if "KYBER" in val_clean or "ML-KEM" in val_clean or "DILITHIUM" in val_clean or "ML-DSA" in val_clean:
-                    readable_snippet = f"\"{val_clean}\""
-                    if "KYBER" in val_clean or "ML-KEM" in val_clean:
-                        findings_list.append(report_finding(readable_snippet, filepath, line_num, "B501_KYBER"))
-                    elif "DILITHIUM" in val_clean or "ML-DSA" in val_clean:
-                        findings_list.append(report_finding(readable_snippet, filepath, line_num, "B502_DILITHIUM"))
-
-    return findings_list
-
-# --- C/C++ 掃描核心 ---
-def scan_c_cpp(filepath):
-    print(f"C/C++ 掃描邏輯尚未實作。")
-    return []
-
-
-# --- 主控函數 ---
-def scan_project_recursive(root_dir):
-    all_findings = []
-    SUPPORTED_EXTENSIONS = ('.py', '.java', '.c', '.cpp')
-
-    for dirpath, dirnames, filenames in os.walk(root_dir):
-        if 'pqc_venv' in dirpath or '.git' in dirpath: # 忽略虚拟环境和 Git 目录
-            continue
-            
-        for filename in filenames:
-            if filename.endswith(SUPPORTED_EXTENSIONS):
-                filepath = os.path.join(dirpath, filename)
-                print(f"掃描檔案: {filepath}")
-                
                 try:
-                    findings = scan_file(filepath)
-                    all_findings.extend(findings)
-                except Exception as e:
-                    print(f"❌ 檔案 {filepath} 掃描失敗: {e}")
+                    # 執行掃描
+                    findings = scan_file(tmp_path)
                     
-    return all_findings
+                    # 修正 Location：將暫存路徑改回原始檔名，方便閱讀
+                    for f in findings:
+                        f['Location'] = f['Location'].replace(tmp_path, file.name)
+                    
+                    all_findings.extend(findings)
+                finally:
+                    os.unlink(tmp_path)
 
+            # 將所有結果轉為 DataFrame 存入 Session
+            if all_findings:
+                df = pd.DataFrame(all_findings)
+                # 確保你的 scanner.py 有定義這個狀態判斷函數
+                df['PQC_Status'] = df['RuleID'].apply(_determine_pqc_status)
+                st.session_state['findings'] = df
+                st.session_state['last_file'] = f"多檔案掃描 ({len(uploaded_files)} 檔案)"
+            else:
+                st.session_state['findings'] = pd.DataFrame()
 
-def scan_file(filepath):
-    if filepath.endswith(".py"):
-        return scan_python(filepath)
-    elif filepath.endswith(".java"):
-        return scan_java(filepath)
-    elif filepath.endswith(".c") or filepath.endswith(".cpp"):
-        return scan_c_cpp(filepath)
-    else:
-        return []
+    #資料夾掃描
+    st.divider()
+    st.markdown("### 資料夾掃描")
+    
+    # 獲取原始輸入
+    raw_path = st.text_input("輸入本機資料夾路徑:", placeholder="C:/Users/Project/src")
+    
+    # --- 新增：自動移除前後引號與空白 ---
+    clean_path = raw_path.strip().strip('"').strip("'")
+    
+    if st.button("直接掃描該目錄"):
+        if clean_path and os.path.isdir(clean_path):
+            with st.spinner(f"正在掃描：{clean_path}"):
+                # 執行你原本的掃描邏輯
+                from scanner import scan_project_recursive
+                results = scan_project_recursive(clean_path)
+                
+                if results:
+                    df = pd.DataFrame(results)
+                    # 補上 PQC 狀態判斷
+                    df['PQC_Status'] = df['RuleID'].apply(_determine_pqc_status)
+                    st.session_state['findings'] = df
+                    st.session_state['last_file'] = f"目錄掃描: {os.path.basename(clean_path)}"
+                    st.success("掃描完成！")
+                else:
+                    st.warning("該目錄下未發現支援的程式碼檔案。")
+        elif not clean_path:
+            st.warning("請輸入路徑。")
+        else:
+            st.error(f"路徑無效，請檢查：{clean_path}")
+                
+# --- 3. 主內容區：對話與圖表 ---
+chat_col, chart_col = st.columns([6, 4], gap="medium")
 
-def generate_cbom_json(findings):
+# 【中間：對話區】
+with chat_col:
+    with st.container(border=True):
+        st.markdown("#### 對話 ")
+
+    chat_container = st.container(height=500)
+
+    #顯示歷史訊息 (讓舊對話留著) ---
+    with chat_container:
+        for m in st.session_state.messages:
+            with st.chat_message(m["role"]):
+                st.markdown(m["content"])
+
+    # 對話輸入
+    if prompt := st.chat_input("詢問有關掃描結果的建議..."):
+        # 1. 顯示使用者訊息
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with chat_container:
+            with st.chat_message("user"):
+                st.markdown(prompt)
+
+        # 2. 呼叫 AI (加入錯誤攔截)
+        with chat_container:
+            with st.chat_message("assistant"):
+                try:
+                    context = get_pqc_context()
+                    full_prompt = f"你是 PQC 專家。請根據數據回答：\n{context}\n\n問題：{prompt}"
+                    
+                    with st.spinner("AI 正在思考中..."):
+                        # 執行生成
+                        response = model.generate_content(full_prompt)
+                        answer = response.text
+                        st.markdown(answer)
+                        st.session_state.messages.append({"role": "assistant", "content": answer})
+                
+                except Exception as e:
+                    # 專門處理 429 流量限制錯誤
+                    if "429" in str(e):
+                        st.error("⚠️ 觸發 Gemini 免費版流量限制。請等待約 1 分鐘後再試。")
+                        st.info("提示：由於您目前使用免費 API，請避免短時間內連續提問。")
+                    else:
+                        st.error(f"連線 AI 失敗：{e}")
+
+# 【右側：圖表區】
+def generate_risk_pie_chart_object(findings):
     """
-    將掃描結果轉換為簡化的 CBOM (Cryptographic Bill of Materials) 格式。
+    修改自你的原始碼：回傳 plotly.graph_objects.Figure 物件，以便 Streamlit 使用。
     """
-    cbom_data = {
-        "metadata": {
-            "tool": "PQC Hybrid Auditor",
-            "version": "1.0",
-            "total_findings": len(findings),
-            "timestamp": datetime.now().isoformat()
-        },
-        "cryptographic_assets": []
+    if not findings:
+        return None
+        
+    df = pd.DataFrame(findings)
+    
+    # 你原本定義的專業顏色地圖
+    color_map = {
+        'WEAK_HASH_SHA1': '#D35400', 'WEAK_HASH_MD5': '#C0392B', 
+        'WEAK_CIPHER_DES': '#C0392B', 'WEAK_ASSET_RSA': '#D35400', 
+        'WEAK_CIPHER_MODE': '#C0392B', 'WEAK_IV_NONCE': '#D35400', 
+        'PQC_TARGET_RSA': '#2980B9', 'PQC_TARGET_ECC': '#2980B9', 
+        'TRADITIONAL_AES_ASSET': '#27AE60', 'SECRET_LEAKAGE': '#C0392B',    
+        'PQC_KEM_ML_KEM': '#2980B9', 'PQC_SIGN_ML_DSA': '#2980B9', 
+        'HARDCODED_SECRET_KEY': '#C0392B', 'HARDCODED_PASSWORD': '#C0392B', 
+        'HARDCODED_CLOUD_CREDENTIAL': '#C0392B', 'HARDCODED_API_TOKEN': '#C0392B', 
+        'HARDCODED_PQC_PRIVATE_KEY': '#C0392B', 'WEAK_RANDOM_SOURCE': '#C0392B', 
+        'WEAK_ECC_CURVE': '#D35400', 'WEAK_KDF_ITERATION_COUNT': '#D35400', 
+        'INSUFFICIENT_SALT_LENGTH': '#D35400', 'RISKY_GCM_NONCE_LENGTH': '#D35400',
     }
     
-    for finding in findings:
-        # 根據 RuleID 判斷資產類型 (簡化)
-        asset_type = "ASYMMETRIC_PQC" if 'RSA' in finding['RuleID'] or 'ECC' in finding['RuleID'] else "SYMMETRIC_HASH_ETC"
-        
-        cbom_data['cryptographic_assets'].append({
-            "asset_id": finding['RuleID'],
-            "location": finding['Location'],
-            "type": asset_type,
-            "code_snippet": finding['CodeSnippet'],
-            "risk_status": finding['Type'],
-        })
-        
-    return cbom_data
+    stats = df['Type'].value_counts().reset_index()
+    stats.columns = ['Type', 'Count']
+    stats['Color'] = stats['Type'].map(color_map).fillna('#95A5A6')
+    stats = stats.sort_values(by=['Color', 'Count'], ascending=[True, False])
 
-
-if __name__ == "__main__":
-    # 這裡放一個測試用的範例，或是指定一個目錄進行掃描
-    test_directory = "."  # 掃描當前目錄
-    findings = scan_project_recursive(test_directory)
+    fig = go.Figure(data=[go.Pie(
+        labels=stats['Type'],
+        values=stats['Count'],
+        hole=.4, 
+        marker=dict(colors=stats['Color']),
+        hovertemplate='%{label}<br>數量: %{value}<extra></extra>',
+        sort=False 
+    )])
     
-    if findings:
-        # 1. 生成 CBOM JSON
-        cbom_json_content = generate_cbom_json(findings)
-        cbom_filename = "PQC_CBOM_Inventory.json"
+    fig.update_layout(
+        title={
+            'text': "PQC 遷移與弱點風險分佈 (總資產數: {})".format(len(findings)),
+            'y': 0.95,      # 垂直位置 (0 到 1)
+            'x': 0.5,       # 水平位置 (0.5 為絕對置中)
+            'xanchor': 'center',
+            'yanchor': 'top'
+        },
+        font_color="#E0E0E0",
+        # 調整邊距，確保標題有足夠空間且不與圖表重疊
+        margin=dict(l=20, r=20, t=80, b=20),
+        paper_bgcolor='rgba(0,0,0,0)',   # 透明背景，適應 Streamlit 主題
+        plot_bgcolor='rgba(0,0,0,0)',
+        showlegend=False
+    )
+    return fig
+
+# --- 2. 在 website.py 的右側欄位呼叫 ---
+with chart_col:
+    with st.container(border=True): 
+        st.markdown("#### 數據視覺化")
         
-        # 2. 寫入檔案
-        with open(cbom_filename, 'w', encoding='utf-8') as f:
-            json.dump(cbom_json_content, f, indent=4, ensure_ascii=False)
+        # 檢查是否有掃描結果
+        if 'findings' in st.session_state and not st.session_state['findings'].empty:
+            # 獲取 findings 資料 (List of Dicts)
+            current_findings = st.session_state['findings'].to_dict('records')
             
-        print(f"✅ 掃描完成！CBOM 報告已儲存至: {cbom_filename}")
-    else:
-        print("❌ 未發現任何加密資產。")
+            # 生成你的 Plotly 圖表
+            fig = generate_risk_pie_chart_object(current_findings)
+            
+            if fig:
+                # 使用 Streamlit 專用指令顯示
+                st.plotly_chart(fig, use_container_width=True)
+            
+            st.divider()
+            
+            # 顯示你原本表格的部分
+            if 'findings' in st.session_state and not st.session_state['findings'].empty:
+                df_display = st.session_state['findings'][['Location', 'Type', 'CodeSnippet', 'FixSuggestion']].copy()    
+
+                df_display.columns = ['位置', '類型', '代碼片段', '修補建議']
+                # 將索引從 0, 1, 2... 改為 1, 2, 3...
+                df_display.index = df_display.index + 1
+    
+                # 顯示表格，hide_index=False 確保顯示我們改過的索引
+                st.dataframe(df_display, use_container_width=True)
+
+        else:
+            st.info("💡 請在左側上傳檔案並點擊「開始掃描」以生成風險圖表。")
+
+        st.divider()
+        # 直接檢查是否有掃描數據，不需再透過 c1, c2 分欄
+        if 'findings' in st.session_state and not st.session_state['findings'].empty:
+            # 1. 準備數據：從 DataFrame 轉回 List of Dicts
+            current_findings = st.session_state['findings'].to_dict('records')
+            
+            # 2. 產出 CBOM JSON 數據
+            from scanner import generate_cbom_json
+            cbom_dict = generate_cbom_json(current_findings)
+            
+            # 3. 轉換為 JSON 字串
+            json_string = json.dumps(cbom_dict, indent=4, ensure_ascii=False)
+            
+            # 4. 實作下載按鈕，移除 with 語句
+            st.download_button(
+                label="📝 下載 CBOM 報告",
+                data=json_string,
+                file_name=f"PQC_Analysis_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+                mime="application/json",
+                use_container_width=True # 讓按鈕自動撐滿寬度
+            )
+        else:
+            # 5. 無數據時顯示禁用的普通按鈕
+            st.button("📝 產生報告 (請先完成掃描)", disabled=True, use_container_width=True)
