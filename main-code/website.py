@@ -39,6 +39,14 @@ def get_ai_response(user_input, scan_context):
 # 1. 頁面配置
 st.set_page_config(page_title="PQC Scanner", layout="wide", initial_sidebar_state="expanded")
 
+# 2. 初始化對話紀錄 (關鍵修正！)
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# 3. 初始化掃描結果 (如果後面有用到，也建議一併初始化)
+if "scan_results" not in st.session_state:
+    st.session_state.scan_results = "尚未掃描"
+    
 # --- 2. 最左側：來源區 (Sidebar) ---
 with st.sidebar:
     st.markdown("### 來源")
