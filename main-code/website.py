@@ -8,7 +8,7 @@ import os
 from datetime import datetime
 import tempfile
 # 匯入你的掃描引擎 (確保 scanner.py 放在同一個資料夾)
-from pqc_ast_scannerV2 import scan_file, _determine_pqc_status
+#from pqc_ast_scannerV2 import scan_file, _determine_pqc_status
 
 # 1. 安全地獲取 API Key (優先從 Secrets 抓，沒有則找環境變數)
 GEMINI_KEY = st.secrets.get("GEMINI_API_KEY") or os.getenv("GEMINI_API_KEY")
